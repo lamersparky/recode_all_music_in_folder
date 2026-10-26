@@ -1,0 +1,21 @@
+#compdef recode_all_music_in_folder
+
+_arguments -s -S \
+  '--target=[Directory containing source audio]:target directory:_files -/' \
+  '--output=[Destination directory]:output directory:_files -/' \
+  '--format=[Output format]:format:(mp3 flac opus aac wav)' \
+  '--recursive[Scan subdirectories (default)]' \
+  '--no-recursive[Scan only the top-level directory]' \
+  '--no-duplicates[SHA-256 every file and skip duplicate content]' \
+  '--no-clipboard[Do not copy the generated launcher]' \
+  '--manual-input[Prompt for target and output paths]' \
+  '--resume[Resume latest unfinished run]' \
+  '--reenter-metadata[Ask again for saved metadata]' \
+  '--lyrics[Prompt for per-file lyrics path]' \
+  '--artist[Prompt for per-file artist]' \
+  '--album[Prompt for per-file album]' \
+  '--title[Prompt for song title; suggest filename]' \
+  '--image[Prompt for per-file cover image]' \
+  '--flush[Clear the database]' \
+  '--verify-script[Verify a generated script]:script:_files' \
+  '--help[Show help]'
