@@ -8,6 +8,8 @@ _arguments -s -S \
   '--no-recursive[Scan only the top-level directory]' \
   '--no-duplicates[SHA-256 every file and skip duplicate content]' \
   '--no-clipboard[Do not copy the generated launcher]' \
+  '--windows-batch[Generate Windows .bat launcher and PowerShell worker]' \
+  '--batch-script[Alias for --windows-batch]' \
   '--manual-input[Prompt for target and output paths]' \
   '--resume[Resume latest unfinished run]' \
   '--reenter-metadata[Ask again for saved metadata]' \

@@ -1,4 +1,8 @@
-#define _GNU_SOURCE
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE 1
+#else
+#define _GNU_SOURCE 1
+#endif
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -24,10 +28,13 @@
 #include <unistd.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
+#ifdef __GLIBC__
 #include <malloc.h>
+#endif
 
 #define APP_NAME "recode_all_music_in_folder"
-#define APP_VERSION "0.1.0"
+#define APP_ID "recode_all_music_in_folder"
+#define APP_VERSION "0.2.0"
 #define HASH_CHUNK (256 * 1024)
 #define ONE_LINER_LIMIT 12000
 #define GREEN "\033[32m"
@@ -70,6 +77,7 @@ typedef struct {
     char *verify_script;
     bool format_set;
     bool no_duplicates_set;
+    bool windows_batch;
 } Options;
 
 typedef struct {
@@ -152,7 +160,9 @@ static void fd_write_all(int fd, const void *data, size_t len) {
 
 static void memory_trim(void) {
     if (g_db) (void)sqlite3_db_release_memory(g_db);
+#ifdef __GLIBC__
     (void)malloc_trim(0);
+#endif
 }
 
 static char *path_join(const char *a, const char *b) {
@@ -411,7 +421,7 @@ static int db_open(const char *path) {
       "CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);"
       "CREATE TABLE IF NOT EXISTS runs("
       "run_uid TEXT PRIMARY KEY,created_at TEXT NOT NULL,target TEXT NOT NULL,output TEXT NOT NULL,"
-      "recursive INTEGER NOT NULL,dedupe_all INTEGER NOT NULL,ask_artist INTEGER NOT NULL,ask_album INTEGER NOT NULL,ask_title INTEGER NOT NULL DEFAULT 0,"
+      "recursive INTEGER NOT NULL,dedupe_all INTEGER NOT NULL,ask_artist INTEGER NOT NULL,ask_album INTEGER NOT NULL,ask_title INTEGER NOT NULL DEFAULT 0,windows_batch INTEGER NOT NULL DEFAULT 0,"
       "ask_lyrics INTEGER NOT NULL,ask_image INTEGER NOT NULL,format TEXT NOT NULL,status TEXT NOT NULL,"
       "command_text TEXT,generated_script TEXT,script_signature TEXT,script_sha256 TEXT,default_artist TEXT,default_album TEXT,last_error TEXT);"
       "CREATE TABLE IF NOT EXISTS files("
@@ -431,6 +441,7 @@ static int db_open(const char *path) {
     if (db_exec(schema)) return -1;
     /* Additive migrations keep databases from earlier RAMIF builds usable. */
     if (db_ensure_column("runs", "ask_title", "INTEGER NOT NULL DEFAULT 0") != 0 ||
+        db_ensure_column("runs", "windows_batch", "INTEGER NOT NULL DEFAULT 0") != 0 ||
         db_ensure_column("files", "title", "TEXT") != 0 ||
         db_ensure_column("files", "lyrics_prompted", "INTEGER NOT NULL DEFAULT 0") != 0) return -1;
     return 0;
@@ -549,18 +560,61 @@ static int write_ini(const App *a) {
     fprintf(f,"[FFMPEG]\npath = %s\n\n",a->ffmpeg_path);
     fprintf(f,"[PATH]\nbinary = %s\ndata_dir = %s\ndatabase = %s\n\n",a->binary_path,a->data_dir,a->db_path);
     fprintf(f,"[KEY]\ngpg_home = %s\nprivate_key_directory = %s/private-keys-v1.d\npublic_keyring = %s/pubring.kbx\npublic_key_export = %s\nfingerprint = %s\nprotection = unprotected; rely on user-account and directory permissions\n\n",a->gpg_home,a->gpg_home,a->gpg_home,a->public_key_path,a->fingerprint?a->fingerprint:"");
-    fprintf(f,"[MISC]\nversion = %s\ncreated_or_updated = %s\nclipboard = wl-copy, xclip, or xsel when available\npath_completion = built-in Tab completion; Bash and Zsh completion files included\n",APP_VERSION,timebuf);
+    fprintf(f,"[MISC]\nversion = %s\ncreated_or_updated = %s\nclipboard = pbcopy (macOS), wl-copy, xclip, or xsel (Linux) when available\npath_completion = built-in Tab completion; Bash and Zsh completion files included\n",APP_VERSION,timebuf);
     if (fclose(f)!=0) { log_error("Failed writing config."); unlink(tmp); free(tmp); return -1; }
     chmod(tmp,0600); if (rename(tmp,a->ini_path)!=0) { log_error("Cannot replace config: %s",strerror(errno)); unlink(tmp); free(tmp); return -1; }
     free(tmp); return 0;
 }
+static void migrate_legacy_data_dir(App *a, const char *home, const char *xdg) {
+    char *legacy = NULL;
+    char *base = NULL;
+    struct stat old_st, new_st;
+    if (stat(a->data_dir, &new_st) == 0) return;
+    if (xdg && *xdg) legacy = path_join(xdg, "recode_all_music_in_folder");
+    else {
+        base = path_join(home, ".local/share");
+        legacy = path_join(base, "recode_all_music_in_folder");
+        free(base);
+    }
+    if (legacy && stat(legacy, &old_st) == 0 && S_ISDIR(old_st.st_mode)) {
+        /* On a fresh macOS account the Application Support parent may not exist yet. */
+        char *new_parent = path_dirname_dup(a->data_dir);
+        int parent_rc = new_parent ? mkdir_p(new_parent, 0700) : -1;
+        int parent_errno = errno;
+        free(new_parent);
+        if (parent_rc == 0 && rename(legacy, a->data_dir) == 0) {
+            const char *pairs[][2] = {
+                {"ramif.ini", "recode_all_music_in_folder.ini"}
+            };
+            size_t i;
+            for (i = 0; i < sizeof(pairs) / sizeof(pairs[0]); ++i) {
+                char *old_file = path_join(a->data_dir, pairs[i][0]);
+                char *new_file = path_join(a->data_dir, pairs[i][1]);
+                struct stat st;
+                if (old_file && new_file && stat(old_file, &st) == 0 && stat(new_file, &st) != 0)
+                    (void)rename(old_file, new_file);
+                free(old_file); free(new_file);
+            }
+            log_info("Migrated existing state directory from %s to %s.", legacy, a->data_dir);
+        } else {
+            if (parent_rc != 0) errno = parent_errno;
+            log_warn("Could not automatically migrate legacy state directory %s: %s", legacy, strerror(errno));
+        }
+    }
+    free(legacy);
+}
+
 static int init_app(App *a, const char *argv0) {
     memset(a,0,sizeof(*a));
     const char *home=getenv("HOME"); if (!home || !*home) { struct passwd *pw=getpwuid(getuid()); home=pw?pw->pw_dir:"/tmp"; }
     a->home=xstrdup(home);
     const char *xdg=getenv("XDG_DATA_HOME");
-    if (xdg && *xdg) a->data_dir=path_join(xdg,APP_NAME);
-    else { char *base=path_join(home,".local/share"); a->data_dir=path_join(base,APP_NAME); free(base); }
+    if (xdg && *xdg) a->data_dir=path_join(xdg,APP_ID);
+#ifdef __APPLE__
+    else { char *base=path_join(home,"Library/Application Support"); a->data_dir=path_join(base,"RAMIF"); free(base); }
+#else
+    else { char *base=path_join(home,".local/share"); a->data_dir=path_join(base,APP_ID); free(base); }
+#endif
     a->db_path=path_join(a->data_dir,"ramif_database.db"); a->ini_path=path_join(a->data_dir,"recode_all_music_in_folder.ini");
     a->gpg_home=path_join(a->data_dir,"gnupg"); a->public_key_path=path_join(a->data_dir,"public-key.asc");
     a->binary_path=current_binary_path(argv0); a->ffmpeg_path=find_executable("ffmpeg"); a->gpg_path=find_executable("gpg");
@@ -570,6 +624,7 @@ static int init_app(App *a, const char *argv0) {
     if (!a->binary_path) a->binary_path=xstrdup(argv0);
     if (!a->ffmpeg_path) { log_error("ffmpeg was not found in PATH."); return -1; }
     if (!a->gpg_path) { log_error("gpg was not found in PATH."); return -1; }
+    migrate_legacy_data_dir(a, home, xdg);
     if (mkdir_p(a->data_dir,0700)!=0) { log_error("Cannot create state directory %s: %s",a->data_dir,strerror(errno)); return -1; }
     chmod(a->data_dir,0700); return 0;
 }
@@ -603,6 +658,7 @@ static void usage(FILE *f) {
 "  --format FORMAT        mp3 (default), flac, opus, aac, or wav\n"
 "  --no-duplicates        SHA-256 every audio file; plan only one identical copy\n"
 "  --no-clipboard         Do not copy the generated command/script launcher\n"
+"  --windows-batch        Generate a Windows .bat launcher plus signed PowerShell worker\n"
 "  --manual-input         Prompt for target/output (Tab completes paths)\n"
 "  --resume               Resume the latest unfinished database run\n"
 "  --reenter-metadata     Re-prompt metadata already saved in a resumed run\n"
@@ -632,6 +688,7 @@ static int parse_args(int argc, char **argv, Options *o) {
         else if (strcmp(arg,"--output")==0 || strncmp(arg,"--output=",9)==0) { if (!need_value(argc,argv,&i,arg,&v)) return -1; free(o->output); o->output=xstrdup(v); }
         else if (strcmp(arg,"--format")==0 || strncmp(arg,"--format=",9)==0) { if (!need_value(argc,argv,&i,arg,&v)) return -1; free(o->format); o->format=xstrdup(v); o->format_set=true; }
         else if (strcmp(arg,"--no-clipboard")==0) o->no_clipboard=true;
+        else if (strcmp(arg,"--windows-batch")==0 || strcmp(arg,"--batch-script")==0) o->windows_batch=true;
         else if (strcmp(arg,"--no-duplicates")==0) { o->no_duplicates=true; o->no_duplicates_set=true; }
         else if (strcmp(arg,"--manual-input")==0) o->manual_input=true;
         else if (strcmp(arg,"--lyrics")==0) o->ask_lyrics=true;
@@ -672,22 +729,22 @@ static int verify_script(App *a, const char *path) {
 
 static int create_run(App *a, Options *o, char **uid_out) {
     char *uid=make_run_uid(a), *now=utc_now(); sqlite3_stmt *st=NULL;
-    const char *sql="INSERT INTO runs(run_uid,created_at,target,output,recursive,dedupe_all,ask_artist,ask_album,ask_title,ask_lyrics,ask_image,format,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,'SCANNING')";
+    const char *sql="INSERT INTO runs(run_uid,created_at,target,output,recursive,dedupe_all,ask_artist,ask_album,ask_title,windows_batch,ask_lyrics,ask_image,format,status) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'SCANNING')";
     if (db_prepare(sql,&st)) { free(uid); free(now); return -1; }
     sqlite3_bind_text(st,1,uid,-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,2,now,-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,3,o->target,-1,SQLITE_TRANSIENT); sqlite3_bind_text(st,4,o->output,-1,SQLITE_TRANSIENT);
-    sqlite3_bind_int(st,5,o->recursive); sqlite3_bind_int(st,6,o->no_duplicates); sqlite3_bind_int(st,7,o->ask_artist); sqlite3_bind_int(st,8,o->ask_album); sqlite3_bind_int(st,9,o->ask_title); sqlite3_bind_int(st,10,o->ask_lyrics); sqlite3_bind_int(st,11,o->ask_image); sqlite3_bind_text(st,12,o->format,-1,SQLITE_TRANSIENT);
+    sqlite3_bind_int(st,5,o->recursive); sqlite3_bind_int(st,6,o->no_duplicates); sqlite3_bind_int(st,7,o->ask_artist); sqlite3_bind_int(st,8,o->ask_album); sqlite3_bind_int(st,9,o->ask_title); sqlite3_bind_int(st,10,o->windows_batch); sqlite3_bind_int(st,11,o->ask_lyrics); sqlite3_bind_int(st,12,o->ask_image); sqlite3_bind_text(st,13,o->format,-1,SQLITE_TRANSIENT);
     int rc=db_step_done(st); sqlite3_finalize(st); free(now); if (rc) { free(uid); return -1; } *uid_out=uid; return 0;
 }
-typedef struct { char *uid,*target,*output,*format,*status,*default_artist,*default_album; bool recursive,dedupe_all,ask_artist,ask_album,ask_title,ask_lyrics,ask_image; } RunInfo;
+typedef struct { char *uid,*target,*output,*format,*status,*default_artist,*default_album; bool recursive,dedupe_all,ask_artist,ask_album,ask_title,ask_lyrics,ask_image,windows_batch; } RunInfo;
 static void free_runinfo(RunInfo *r) { free(r->uid); free(r->target); free(r->output); free(r->format); free(r->status); free(r->default_artist); free(r->default_album); memset(r,0,sizeof(*r)); }
 static int load_run(const char *uid, RunInfo *r) {
-    sqlite3_stmt *st=NULL; const char *sql="SELECT run_uid,target,output,format,status,recursive,dedupe_all,ask_artist,ask_album,ask_title,ask_lyrics,ask_image,COALESCE(default_artist,''),COALESCE(default_album,'') FROM runs WHERE run_uid=?1";
+    sqlite3_stmt *st=NULL; const char *sql="SELECT run_uid,target,output,format,status,recursive,dedupe_all,ask_artist,ask_album,ask_title,windows_batch,ask_lyrics,ask_image,COALESCE(default_artist,''),COALESCE(default_album,'') FROM runs WHERE run_uid=?1";
     if (db_prepare(sql,&st)) return -1;
     sqlite3_bind_text(st,1,uid,-1,SQLITE_TRANSIENT); int rc=sqlite3_step(st);
     if (rc!=SQLITE_ROW) { sqlite3_finalize(st); return -1; }
     r->uid=xstrdup((const char*)sqlite3_column_text(st,0)); r->target=xstrdup((const char*)sqlite3_column_text(st,1)); r->output=xstrdup((const char*)sqlite3_column_text(st,2)); r->format=xstrdup((const char*)sqlite3_column_text(st,3)); r->status=xstrdup((const char*)sqlite3_column_text(st,4));
-    r->recursive=sqlite3_column_int(st,5)!=0; r->dedupe_all=sqlite3_column_int(st,6)!=0; r->ask_artist=sqlite3_column_int(st,7)!=0; r->ask_album=sqlite3_column_int(st,8)!=0; r->ask_title=sqlite3_column_int(st,9)!=0; r->ask_lyrics=sqlite3_column_int(st,10)!=0; r->ask_image=sqlite3_column_int(st,11)!=0;
-    r->default_artist=xstrdup((const char*)sqlite3_column_text(st,12)); r->default_album=xstrdup((const char*)sqlite3_column_text(st,13)); sqlite3_finalize(st); return 0;
+    r->recursive=sqlite3_column_int(st,5)!=0; r->dedupe_all=sqlite3_column_int(st,6)!=0; r->ask_artist=sqlite3_column_int(st,7)!=0; r->ask_album=sqlite3_column_int(st,8)!=0; r->ask_title=sqlite3_column_int(st,9)!=0; r->windows_batch=sqlite3_column_int(st,10)!=0; r->ask_lyrics=sqlite3_column_int(st,11)!=0; r->ask_image=sqlite3_column_int(st,12)!=0;
+    r->default_artist=xstrdup((const char*)sqlite3_column_text(st,13)); r->default_album=xstrdup((const char*)sqlite3_column_text(st,14)); sqlite3_finalize(st); return 0;
 }
 static int load_latest_run(RunInfo *r) {
     sqlite3_stmt *st=NULL; if (db_prepare("SELECT run_uid FROM runs WHERE status!='DONE' ORDER BY rowid DESC LIMIT 1",&st)) return -1;
@@ -1178,15 +1235,19 @@ static int save_script_record(const char *uid,const char *script,const char *sig
     int rc=db_step_done(st); sqlite3_finalize(st); free(now); return rc;
 }
 static int copy_clipboard(const char *text) {
-    const char *candidates[][3]={{"wl-copy",NULL,NULL},{"xclip","-selection","clipboard"},{"xsel","--clipboard","--input"}};
-    for (size_t i=0;i<3;i++) {
+#ifdef __APPLE__
+    const char *candidates[][3]={{"pbcopy",NULL,NULL},{"wl-copy",NULL,NULL},{"xclip","-selection","clipboard"},{"xsel","--clipboard","--input"}};
+#else
+    const char *candidates[][3]={{"wl-copy",NULL,NULL},{"xclip","-selection","clipboard"},{"xsel","--clipboard","--input"},{"pbcopy",NULL,NULL}};
+#endif
+    for (size_t i=0;i<4;i++) {
         char *exe=find_executable(candidates[i][0]); if (!exe) continue;
         int fds[2]; if (pipe(fds)!=0) { free(exe); continue; }
         pid_t pid=fork(); if (pid==0) {
             dup2(fds[0],STDIN_FILENO); close(fds[0]);close(fds[1]);
-            if (i==0) { char *av[]={exe,NULL}; execv(exe,av); }
-            else if (i==1) { char *av[]={exe,"-selection","clipboard","-in",NULL}; execv(exe,av); }
-            else { char *av[]={exe,"--clipboard","--input",NULL}; execv(exe,av); }
+            if (strcmp(candidates[i][0],"xclip")==0) { char *av[]={exe,"-selection","clipboard","-in",NULL}; execv(exe,av); }
+            else if (strcmp(candidates[i][0],"xsel")==0) { char *av[]={exe,"--clipboard","--input",NULL}; execv(exe,av); }
+            else { char *av[]={exe,NULL}; execv(exe,av); }
             _exit(127);
         }
         close(fds[0]); size_t left=strlen(text); const char *p=text; while (left) { ssize_t n=write(fds[1],p,left); if (n<0) { if(errno==EINTR)continue; break; } p+=n;left-=(size_t)n; }
@@ -1195,7 +1256,386 @@ static int copy_clipboard(const char *text) {
     }
     return -1;
 }
+static int copy_file_binary(const char *src, const char *dst) {
+    FILE *in = fopen(src, "rb");
+    if (!in) return -1;
+    char *dir = path_dirname_dup(dst);
+    if (mkdir_p(dir, 0700) != 0) { free(dir); fclose(in); return -1; }
+    free(dir);
+    FILE *out = fopen(dst, "wb");
+    if (!out) { fclose(in); return -1; }
+    unsigned char buffer[65536];
+    size_t n;
+    int rc = 0;
+    while ((n = fread(buffer, 1, sizeof(buffer), in)) > 0) {
+        if (fwrite(buffer, 1, n, out) != n) { rc = -1; break; }
+    }
+    if (ferror(in)) rc = -1;
+    if (fclose(in) != 0) rc = -1;
+    if (fclose(out) != 0) rc = -1;
+    if (rc == 0) (void)chmod(dst, 0600);
+    return rc;
+}
+
+/* PowerShell literals are represented as Base64 UTF-8 expressions so arbitrary
+ * punctuation, quotes, Unicode, and newlines cannot inject code into the helper. */
+static char *powershell_b64_expr(const char *value) {
+    const char *s = value ? value : "";
+    size_t len = strlen(s);
+    if (len > (size_t)INT_MAX) return NULL;
+    size_t cap = 4 * ((len + 2) / 3) + 1;
+    unsigned char *encoded = xmalloc(cap);
+    int n = EVP_EncodeBlock(encoded, (const unsigned char *)s, (int)len);
+    if (n < 0) { free(encoded); return NULL; }
+    encoded[n] = '\0';
+    char *expr = str_printf("[System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('%s'))", (char *)encoded);
+    free(encoded);
+    return expr;
+}
+
+static char *windows_slashes(const char *path) {
+    char *copy = xstrdup(path ? path : "");
+    for (char *p = copy; *p; p++) if (*p == '/') *p = '\\';
+    return copy;
+}
+
+/* A Linux filename can be valid on Linux but impossible to represent on Windows.
+ * Reject those paths instead of emitting a batch package that silently cannot work. */
+static bool windows_relative_path_valid(const char *path) {
+    if (!path || !*path || path[0] == '/' || path[0] == '\\') return false;
+    const char *segment = path;
+    for (const char *p = path;; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '<' || c == '>' || c == ':' || c == '"' || c == '|' || c == '?' || c == '*' || c == '\\') return false;
+        if (c == '/' || c == '\0') {
+            size_t n = (size_t)(p - segment);
+            if (n == 0) return false;
+            if (segment[n-1] == ' ' || segment[n-1] == '.') return false;
+            char *name = xmalloc(n + 1);
+            memcpy(name, segment, n); name[n] = '\0';
+            char *dot = strchr(name, '.'); if (dot) *dot = '\0';
+            bool reserved = !strcasecmp(name, "CON") || !strcasecmp(name, "PRN") ||
+                            !strcasecmp(name, "AUX") || !strcasecmp(name, "NUL");
+            if (strlen(name) == 4) {
+                char pfx[4]; memcpy(pfx, name, 3); pfx[3] = '\0';
+                if ((!strcasecmp(pfx, "COM") || !strcasecmp(pfx, "LPT")) && name[3] >= '1' && name[3] <= '9') reserved = true;
+            }
+            free(name);
+            if (reserved) return false;
+            if (c == '\0') break;
+            segment = p + 1;
+        }
+        if (c == '\0') break;
+    }
+    return true;
+}
+
+static int write_ps_value(FILE *f, const char *name, const char *value) {
+    char *expr = powershell_b64_expr(value);
+    if (!expr) return -1;
+    int rc = fprintf(f, "  %s = %s\n", name, expr) < 0 ? -1 : 0;
+    free(expr);
+    return rc;
+}
+
+static int write_ps_nullable_value(FILE *f, const char *name, const char *value) {
+    if (!value || !*value) return fprintf(f, "  %s = $null\n", name) < 0 ? -1 : 0;
+    return write_ps_value(f, name, value);
+}
+
+static int plan_and_emit_windows_batch(App *a, RunInfo *r, Options *o) {
+    (void)o;
+    char *script_dir = path_join(a->data_dir, "scripts");
+    if (mkdir_p(script_dir, 0700) != 0) { free(script_dir); return -1; }
+    char *stem = str_printf("recode-RAMIF-%s", r->uid);
+    char *script_path = str_printf("%s/%s.bat", script_dir, stem);
+    char *ps_path = str_printf("%s/%s.ps1", script_dir, stem);
+    char *sig_path = str_printf("%s.asc", script_path);
+    char *ps_sig_path = str_printf("%s.asc", ps_path);
+    char *assets_name = str_printf("%s-assets", stem);
+    char *assets_dir = path_join(script_dir, assets_name);
+    char *tmp_bat = str_printf("%s/.%s.tmp.bat", script_dir, stem);
+    char *tmp_ps = str_printf("%s/.%s.tmp.ps1", script_dir, stem);
+    FILE *ps = NULL, *bat = NULL;
+    bool assets_created = false;
+    uint64_t actions_n = 0;
+    sqlite3_int64 last_id = 0;
+    int failed = 0;
+
+    if (mkdir_p(assets_dir, 0700) != 0) {
+        log_error("Cannot create Windows batch asset directory: %s", strerror(errno)); failed = 1; goto cleanup;
+    }
+    assets_created = true;
+    ps = fopen(tmp_ps, "w");
+    if (!ps) { log_error("Cannot create PowerShell worker: %s", strerror(errno)); failed = 1; goto cleanup; }
+    (void)chmod(tmp_ps, 0600);
+    fprintf(ps,
+        "$ErrorActionPreference = 'Stop'\n"
+        "# RAMIF Windows conversion worker; generated by %s %s\n"
+        "# Run ID: %s\n"
+        "$jobs = @()\n\n", APP_NAME, APP_VERSION, r->uid);
+
+    for (;;) {
+        sqlite3_stmt *st = NULL;
+        const char *sql = "SELECT file_id,relpath,COALESCE(artist,''),COALESCE(album,''),COALESCE(title,''),COALESCE(lyrics_path,''),COALESCE(image_path,''),COALESCE(status,'') FROM files WHERE run_uid=?1 AND duplicate_of IS NULL AND file_id>?2 ORDER BY file_id LIMIT 1";
+        if (db_prepare(sql, &st) != 0) { failed = 1; break; }
+        sqlite3_bind_text(st, 1, r->uid, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, last_id);
+        int sr = sqlite3_step(st);
+        if (sr != SQLITE_ROW) { sqlite3_finalize(st); break; }
+        sqlite3_int64 id = sqlite3_column_int64(st, 0); last_id = id;
+        char *rel = xstrdup((const char *)sqlite3_column_text(st, 1));
+        char *artist = xstrdup((const char *)sqlite3_column_text(st, 2));
+        char *album = xstrdup((const char *)sqlite3_column_text(st, 3));
+        char *title = xstrdup((const char *)sqlite3_column_text(st, 4));
+        char *lyrics = xstrdup((const char *)sqlite3_column_text(st, 5));
+        char *image = xstrdup((const char *)sqlite3_column_text(st, 6));
+        char *status = xstrdup((const char *)sqlite3_column_text(st, 7));
+        sqlite3_finalize(st);
+        if (!strcmp(status, "DONE")) { free(rel); free(artist); free(album); free(title); free(lyrics); free(image); free(status); continue; }
+
+        char *out_rel_raw = get_file_output_path("", rel, r->format);
+        if (!windows_relative_path_valid(rel) || !windows_relative_path_valid(out_rel_raw)) {
+            log_warn("Cannot represent this Linux path in a Windows batch script; skipping: %s", rel);
+            update_file_text(id, "error", "path is not representable on Windows");
+            free(rel); free(out_rel_raw); free(artist); free(album); free(title); free(lyrics); free(image); free(status); continue;
+        }
+        char *in_rel = windows_slashes(rel);
+        char *out_rel = windows_slashes(out_rel_raw);
+        char *output_full = get_file_output_path(r->output, rel, r->format);
+        update_file_text(id, "output_path", output_full);
+
+        char *lyrics_asset = NULL, *lyrics_hash = NULL, *image_asset = NULL, *image_hash = NULL;
+        if (lyrics && *lyrics) {
+            char *lyric_dir = path_join(assets_dir, "lyrics");
+            if (mkdir_p(lyric_dir, 0700) != 0) { free(lyric_dir); failed = 1; }
+            else {
+                char *lyric_name = str_printf("%lld.txt", (long long)id);
+                char *lyric_dst = path_join(lyric_dir, lyric_name);
+                if (copy_file_binary(lyrics, lyric_dst) != 0) {
+                    log_error("Could not bundle lyrics for Windows batch file %lld: %s", (long long)id, lyrics); failed = 1;
+                } else {
+                    char hash[65];
+                    if (sha256_path(lyric_dst, hash) != 0) failed = 1;
+                    else {
+                        lyrics_hash = xstrdup(hash);
+                        lyrics_asset = str_printf("%s\\lyrics\\%s", assets_name, lyric_name);
+                    }
+                }
+                free(lyric_dst); free(lyric_name);
+            }
+            free(lyric_dir);
+        }
+        if (!failed && image && *image) {
+            char *image_dir = path_join(assets_dir, "images");
+            if (mkdir_p(image_dir, 0700) != 0) { free(image_dir); failed = 1; }
+            else {
+                char *ext = extension_lower(image); if (!*ext || strlen(ext) > 12) { free(ext); ext = xstrdup(".img"); }
+                char *image_name = str_printf("%lld%s", (long long)id, ext);
+                char *image_dst = path_join(image_dir, image_name);
+                if (copy_file_binary(image, image_dst) != 0) {
+                    log_error("Could not bundle cover image for Windows batch file %lld: %s", (long long)id, image); failed = 1;
+                } else {
+                    char hash[65];
+                    if (sha256_path(image_dst, hash) != 0) failed = 1;
+                    else {
+                        image_hash = xstrdup(hash);
+                        image_asset = str_printf("%s\\images\\%s", assets_name, image_name);
+                    }
+                }
+                free(image_dst); free(image_name); free(ext);
+            }
+            free(image_dir);
+        }
+        if (failed) {
+            free(rel); free(out_rel_raw); free(in_rel); free(out_rel); free(output_full); free(artist); free(album); free(title); free(lyrics); free(image); free(status); free(lyrics_asset); free(lyrics_hash); free(image_asset); free(image_hash); break;
+        }
+
+        if (fprintf(ps, "$jobs += [pscustomobject]@{\n  Id = %lld\n", (long long)id) < 0 ||
+            write_ps_value(ps, "Input", in_rel) != 0 ||
+            write_ps_value(ps, "Output", out_rel) != 0 ||
+            write_ps_value(ps, "Format", r->format) != 0 ||
+            write_ps_value(ps, "Title", title) != 0 ||
+            write_ps_value(ps, "Artist", artist) != 0 ||
+            write_ps_value(ps, "Album", album) != 0 ||
+            write_ps_nullable_value(ps, "Lyrics", lyrics_asset) != 0 ||
+            write_ps_nullable_value(ps, "LyricsHash", lyrics_hash) != 0 ||
+            write_ps_nullable_value(ps, "Image", image_asset) != 0 ||
+            write_ps_nullable_value(ps, "ImageHash", image_hash) != 0 ||
+            fputs("}\n\n", ps) == EOF) {
+            log_error("Failed writing PowerShell conversion job."); failed = 1;
+        }
+        if (!failed) {
+            sqlite3_stmt *u = NULL;
+            if (!db_prepare("UPDATE files SET status='PLANNED' WHERE file_id=?1 AND status!='DONE'", &u)) {
+                sqlite3_bind_int64(u, 1, id); db_step_done(u); sqlite3_finalize(u);
+            }
+            actions_n++;
+        }
+        free(rel); free(out_rel_raw); free(in_rel); free(out_rel); free(output_full); free(artist); free(album); free(title); free(lyrics); free(image); free(status); free(lyrics_asset); free(lyrics_hash); free(image_asset); free(image_hash);
+        memory_trim();
+        if (failed) break;
+    }
+    if (failed) goto cleanup;
+    if (actions_n == 0) {
+        if (ps) { fclose(ps); ps = NULL; }
+        unlink(tmp_ps);
+        unlink(tmp_bat);
+        if (assets_created) (void)rmdir(assets_dir);
+        log_warn("No Windows-compatible unfinished tracks remain for this run.");
+        update_run_status(r->uid, "DONE");
+        goto cleanup;
+    }
+    if (fputs(
+        "\n$sourceRoot = $env:RAMIF_SOURCE_ROOT\n"
+        "$outputRoot = $env:RAMIF_OUTPUT_ROOT\n"
+        "if ([string]::IsNullOrWhiteSpace($sourceRoot) -or [string]::IsNullOrWhiteSpace($outputRoot)) { throw 'The batch launcher did not provide source/output roots.' }\n"
+        "$sourceRoot = [System.IO.Path]::GetFullPath($sourceRoot)\n"
+        "$outputRoot = [System.IO.Path]::GetFullPath($outputRoot)\n"
+        "$ffmpegCommand = Get-Command 'ffmpeg.exe' -ErrorAction SilentlyContinue\n"
+        "if (-not $ffmpegCommand) { $ffmpegCommand = Get-Command 'ffmpeg' -ErrorAction SilentlyContinue }\n"
+        "if (-not $ffmpegCommand) { throw 'FFmpeg was not found. Install FFmpeg for Windows and add ffmpeg.exe to PATH.' }\n"
+        "foreach ($job in $jobs) {\n"
+        "  $inputPath = Join-Path $sourceRoot $job.Input\n"
+        "  $outputPath = Join-Path $outputRoot $job.Output\n"
+        "  if (-not (Test-Path -LiteralPath $inputPath -PathType Leaf)) { Write-Warning ('Missing input, skipping: ' + $inputPath); continue }\n"
+        "  if (Test-Path -LiteralPath $outputPath) { Write-Host ('SKIP existing output: ' + $outputPath); continue }\n"
+        "  $outputDirectory = Split-Path -Parent $outputPath\n"
+        "  New-Item -ItemType Directory -Force -Path $outputDirectory | Out-Null\n"
+        "  $ffArgs = [System.Collections.Generic.List[string]]::new()\n"
+        "  $ffArgs.AddRange([string[]]@('-hide_banner','-nostdin','-n','-i',$inputPath))\n"
+        "  $imagePath = $null\n"
+        "  if ($job.Image) {\n"
+        "    $imagePath = Join-Path $PSScriptRoot $job.Image\n"
+        "    if (-not (Test-Path -LiteralPath $imagePath -PathType Leaf)) { throw ('Missing bundled cover image: ' + $imagePath) }\n"
+        "    $actual = (Get-FileHash -LiteralPath $imagePath -Algorithm SHA256).Hash.ToLowerInvariant()\n"
+        "    if ($actual -ne $job.ImageHash) { throw ('Cover image integrity check failed: ' + $imagePath) }\n"
+        "    $ffArgs.AddRange([string[]]@('-i',$imagePath))\n"
+        "  }\n"
+        "  $ffArgs.AddRange([string[]]@('-map','0:a:0'))\n"
+        "  if ($imagePath) { $ffArgs.AddRange([string[]]@('-map','1:v:0','-c:v','copy','-disposition:v:0','attached_pic')) } else { $ffArgs.Add('-vn') }\n"
+        "  $ffArgs.AddRange([string[]]@('-map_metadata','0'))\n"
+        "  if ($job.Title) { $ffArgs.Add('-metadata'); $ffArgs.Add(('title=' + $job.Title)) }\n"
+        "  if ($job.Artist) { $ffArgs.Add('-metadata'); $ffArgs.Add(('artist=' + $job.Artist)) }\n"
+        "  if ($job.Album) { $ffArgs.Add('-metadata'); $ffArgs.Add(('album=' + $job.Album)) }\n"
+        "  if ($job.Lyrics) {\n"
+        "    $lyricsPath = Join-Path $PSScriptRoot $job.Lyrics\n"
+        "    if (-not (Test-Path -LiteralPath $lyricsPath -PathType Leaf)) { throw ('Missing bundled lyrics: ' + $lyricsPath) }\n"
+        "    $actual = (Get-FileHash -LiteralPath $lyricsPath -Algorithm SHA256).Hash.ToLowerInvariant()\n"
+        "    if ($actual -ne $job.LyricsHash) { throw ('Lyrics integrity check failed: ' + $lyricsPath) }\n"
+        "    $lyricsText = [System.IO.File]::ReadAllText($lyricsPath).TrimEnd([char[]]\"`r`n\")\n"
+        "    if ($lyricsText.Length -gt 0) { $ffArgs.Add('-metadata'); $ffArgs.Add(('lyrics=' + $lyricsText)) }\n"
+        "  }\n"
+        "  switch ($job.Format) {\n"
+        "    'mp3'  { $ffArgs.AddRange([string[]]@('-c:a','libmp3lame','-q:a','2')) }\n"
+        "    'flac' { $ffArgs.AddRange([string[]]@('-c:a','flac','-compression_level','5')) }\n"
+        "    'opus' { $ffArgs.AddRange([string[]]@('-c:a','libopus','-b:a','160k')) }\n"
+        "    'aac'  { $ffArgs.AddRange([string[]]@('-c:a','aac','-b:a','256k','-f','ipod')) }\n"
+        "    default { $ffArgs.AddRange([string[]]@('-c:a','pcm_s16le')) }\n"
+        "  }\n"
+        "  $ffArgs.Add($outputPath)\n"
+        "  Write-Host ('CONVERT: ' + $inputPath + ' -> ' + $outputPath)\n"
+        "  $nativeArgs = $ffArgs.ToArray()\n"
+        "  & $ffmpegCommand.Source @nativeArgs\n"
+        "  if ($LASTEXITCODE -ne 0) { Remove-Item -LiteralPath $outputPath -Force -ErrorAction SilentlyContinue; throw ('FFmpeg failed for: ' + $inputPath) }\n"
+        "}\n"
+        "Write-Host 'RAMIF Windows batch conversion plan finished.'\n", ps) == EOF) {
+        log_error("Failed writing PowerShell worker footer."); failed = 1; goto cleanup;
+    }
+    if (fclose(ps) != 0) { ps = NULL; failed = 1; goto cleanup; }
+    ps = NULL;
+
+    bat = fopen(tmp_bat, "w");
+    if (!bat) { log_error("Cannot create Windows batch launcher: %s", strerror(errno)); failed = 1; goto cleanup; }
+    (void)chmod(tmp_bat, 0600);
+    if (fprintf(bat,
+        "@echo off\r\n"
+        "setlocal DisableDelayedExpansion\r\n"
+        "title RAMIF Windows Batch Converter\r\n"
+        "echo.\r\n"
+        "echo RAMIF Windows conversion plan - generated by %s %s\r\n"
+        "echo This launcher uses the signed PowerShell worker beside this file.\r\n"
+        "echo Copy this .bat, its matching .ps1, and the matching -assets folder together.\r\n"
+        "echo.\r\n"
+        "set \"RAMIF_SOURCE_ROOT=\"\r\n"
+        "set /p \"RAMIF_SOURCE_ROOT=Windows folder containing the source music: \"\r\n"
+        "if not defined RAMIF_SOURCE_ROOT goto :bad_source\r\n"
+        "set \"RAMIF_OUTPUT_ROOT=\"\r\n"
+        "set /p \"RAMIF_OUTPUT_ROOT=Windows folder for converted music: \"\r\n"
+        "if not defined RAMIF_OUTPUT_ROOT goto :bad_output\r\n"
+        "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File \"%%~dp0%s.ps1\"\r\n"
+        "if errorlevel 1 goto :failed\r\n"
+        "echo.\r\n"
+        "echo RAMIF conversion plan completed. Existing outputs were not overwritten.\r\n"
+        "pause\r\n"
+        "exit /b 0\r\n"
+        ":bad_source\r\n"
+        "echo ERROR: A source folder is required.\r\n"
+        "pause\r\n"
+        "exit /b 2\r\n"
+        ":bad_output\r\n"
+        "echo ERROR: An output folder is required.\r\n"
+        "pause\r\n"
+        "exit /b 2\r\n"
+        ":failed\r\n"
+        "echo ERROR: The conversion worker reported a failure. Read the error above.\r\n"
+        "pause\r\n"
+        "exit /b 1\r\n", APP_NAME, APP_VERSION, stem) < 0) {
+        log_error("Failed writing Windows batch launcher."); failed = 1; goto cleanup;
+    }
+    if (fclose(bat) != 0) { bat = NULL; failed = 1; goto cleanup; }
+    bat = NULL;
+    if (rename(tmp_ps, ps_path) != 0 || rename(tmp_bat, script_path) != 0) {
+        log_error("Could not finalize Windows batch package: %s", strerror(errno)); failed = 1; goto cleanup;
+    }
+    (void)chmod(ps_path, 0600); (void)chmod(script_path, 0700);
+
+    char batch_hash[65], ps_hash[65];
+    if (sha256_path(script_path, batch_hash) != 0 || sha256_path(ps_path, ps_hash) != 0) {
+        log_error("Could not calculate generated Windows script hashes."); failed = 1; goto cleanup;
+    }
+    if (sign_script(a, script_path, sig_path) != 0) {
+        log_error("Windows batch launcher was created but its signature failed."); failed = 1; goto cleanup;
+    }
+    if (sign_script(a, ps_path, ps_sig_path) != 0) {
+        log_error("PowerShell worker was created but its signature failed."); failed = 1; goto cleanup;
+    }
+    if (save_script_record(r->uid, script_path, sig_path, batch_hash, a->fingerprint) != 0 ||
+        save_script_record(r->uid, ps_path, ps_sig_path, ps_hash, a->fingerprint) != 0) {
+        log_error("Could not save generated Windows script metadata in SQLite."); failed = 1; goto cleanup;
+    }
+    save_generated_plan(r->uid, script_path, script_path, sig_path, batch_hash);
+    char *plan_display = xstrdup(strrchr(script_path, '/') ? strrchr(script_path, '/') + 1 : script_path);
+    printf("\n%sWINDOWS BATCH PACKAGE%s\n  Launcher: %s\n  PowerShell worker: %s\n  Worker signature: %s\n  Assets directory: %s\n  Batch signature: %s\n  Batch SHA-256: %s\n\n",
+           g_color ? CYAN : "", g_color ? RESET : "", script_path, ps_path, ps_sig_path, assets_dir, sig_path, batch_hash);
+    log_info("Generated a Windows .bat launcher and signed PowerShell worker for %llu track(s).", (unsigned long long)actions_n);
+    log_warn("Copy the .bat, .bat.asc, matching .ps1, .ps1.asc, and the entire matching -assets folder to Windows together.");
+    log_info("On Windows, install FFmpeg and ensure ffmpeg.exe is on PATH. The launcher asks for Windows source/output roots.");
+    if (!o->no_clipboard) {
+        if (copy_clipboard(plan_display) == 0) log_info("Copied launcher filename %s to the clipboard.", plan_display);
+        else log_warn("Clipboard copy unavailable (install wl-clipboard, xclip, or xsel (Linux), or use pbcopy (macOS)); the launcher filename is printed above.");
+    } else log_info("--no-clipboard selected; clipboard was not touched.");
+    log_info("Verify both scripts before execution with --verify-script PATH; the .bat signature does not cover its companion files.");
+    log_info("Run ID: %s", r->uid);
+    log_info("Database: %s", a->db_path);
+    log_info("The Windows worker skips existing outputs and never deletes source music.");
+    free(plan_display);
+
+cleanup:
+    if (ps) fclose(ps);
+    if (bat) fclose(bat);
+    if (failed) {
+        unlink(tmp_bat); unlink(tmp_ps);
+        if (assets_created) log_warn("Incomplete Windows batch assets may remain at %s", assets_dir);
+    }
+    free(script_dir); free(stem); free(script_path); free(ps_path); free(sig_path); free(ps_sig_path);
+    free(assets_name); free(assets_dir); free(tmp_bat); free(tmp_ps);
+    return failed ? -1 : 0;
+}
+
+
 static int plan_and_emit(App *a, RunInfo *r, Options *o) {
+    if (o->windows_batch || r->windows_batch) return plan_and_emit_windows_batch(a, r, o);
     uint64_t actions_n=0; bool too_large=false; sqlite3_int64 last_id=0;
     StrBuf one; sb_init(&one); sb_add(&one,"set -e; ");
     char *script_dir=path_join(a->data_dir,"scripts"); if (mkdir_p(script_dir,0700)!=0) { free(script_dir); sb_free(&one); return -1; }
@@ -1240,7 +1680,7 @@ static int plan_and_emit(App *a, RunInfo *r, Options *o) {
         printf("\n%sFFMPEG ONE-LINER%s\n%s\n\n",g_color?CYAN:"",g_color?RESET:"",saved_line);
         save_generated_plan(r->uid,saved_line,NULL,NULL,NULL);
     } else {
-        script_path=str_printf("%s/recode-%s.sh",script_dir,r->uid); sig_path=str_printf("%s.asc",script_path);
+        script_path=str_printf("%s/recode-RAMIF-%s.sh",script_dir,r->uid); sig_path=str_printf("%s.asc",script_path);
         if (rename(tmp_path,script_path)!=0) { log_error("Could not finalize script: %s",strerror(errno)); unlink(tmp_path); free(script_dir);free(tmp_path);free(script_path);free(sig_path);sb_free(&one);return -1; }
         chmod(script_path,0700);
         char hashbuf[65]; if (sha256_path(script_path,hashbuf)!=0) { log_error("Could not calculate script SHA-256."); free(script_dir);free(tmp_path);free(script_path);free(sig_path);sb_free(&one);return -1; }
@@ -1254,7 +1694,7 @@ static int plan_and_emit(App *a, RunInfo *r, Options *o) {
     }
     if (!o->no_clipboard) {
         if (copy_clipboard(plan_display)==0) log_info("Copied the generated command/launcher to the clipboard.");
-        else log_warn("Clipboard copy unavailable (install wl-clipboard, xclip, or xsel); the command is printed above.");
+        else log_warn("Clipboard copy unavailable (install wl-clipboard, xclip, or xsel (Linux), or use pbcopy (macOS)); the command is printed above.");
     } else log_info("--no-clipboard selected; clipboard was not touched.");
     free(plan_display); free(saved_line); free(script_path); free(sig_path); free(filehash); free(script_dir);free(tmp_path);sb_free(&one);
     log_info("Run ID: %s",r->uid); log_info("Database: %s",a->db_path);
@@ -1306,7 +1746,7 @@ int main(int argc,char **argv) {
         if (o.recursive_set) run.recursive=o.recursive;
         if (o.no_duplicates_set) run.dedupe_all=true;
         if (o.format_set) { free(run.format);run.format=xstrdup(o.format); }
-        run.ask_artist=run.ask_artist||o.ask_artist; run.ask_album=run.ask_album||o.ask_album;run.ask_title=run.ask_title||o.ask_title;run.ask_lyrics=run.ask_lyrics||o.ask_lyrics;run.ask_image=run.ask_image||o.ask_image;
+        run.ask_artist=run.ask_artist||o.ask_artist; run.ask_album=run.ask_album||o.ask_album;run.ask_title=run.ask_title||o.ask_title;run.ask_lyrics=run.ask_lyrics||o.ask_lyrics;run.ask_image=run.ask_image||o.ask_image;run.windows_batch=run.windows_batch||o.windows_batch; o.windows_batch=run.windows_batch;
         if (dedupe_changed) {
             sqlite3_stmt *count=NULL; sqlite3_int64 done_count=0;
             if (!db_prepare("SELECT COUNT(*) FROM files WHERE run_uid=?1 AND status='DONE'",&count)) {
@@ -1325,9 +1765,9 @@ int main(int argc,char **argv) {
         }
         o.ask_artist=run.ask_artist; o.ask_album=run.ask_album; o.ask_title=run.ask_title; o.ask_lyrics=run.ask_lyrics; o.ask_image=run.ask_image;
         if (strcmp(run.format,"mp3")&&run.ask_image) log_warn("Existing image choices are not supported for non-MP3 output.");
-        if (o.recursive_set||o.no_duplicates_set||o.format_set||o.ask_artist||o.ask_album||o.ask_title||o.ask_lyrics||o.ask_image) {
-            sqlite3_stmt *u=NULL; if (!db_prepare("UPDATE runs SET recursive=?2,dedupe_all=?3,format=?4,ask_artist=?5,ask_album=?6,ask_title=?7,ask_lyrics=?8,ask_image=?9 WHERE run_uid=?1",&u)) {
-                sqlite3_bind_text(u,1,run.uid,-1,SQLITE_TRANSIENT);sqlite3_bind_int(u,2,run.recursive);sqlite3_bind_int(u,3,run.dedupe_all);sqlite3_bind_text(u,4,run.format,-1,SQLITE_TRANSIENT);sqlite3_bind_int(u,5,run.ask_artist);sqlite3_bind_int(u,6,run.ask_album);sqlite3_bind_int(u,7,run.ask_title);sqlite3_bind_int(u,8,run.ask_lyrics);sqlite3_bind_int(u,9,run.ask_image);db_step_done(u);sqlite3_finalize(u);
+        if (o.recursive_set||o.no_duplicates_set||o.format_set||o.ask_artist||o.ask_album||o.ask_title||o.ask_lyrics||o.ask_image||o.windows_batch) {
+            sqlite3_stmt *u=NULL; if (!db_prepare("UPDATE runs SET recursive=?2,dedupe_all=?3,format=?4,ask_artist=?5,ask_album=?6,ask_title=?7,ask_lyrics=?8,ask_image=?9,windows_batch=?10 WHERE run_uid=?1",&u)) {
+                sqlite3_bind_text(u,1,run.uid,-1,SQLITE_TRANSIENT);sqlite3_bind_int(u,2,run.recursive);sqlite3_bind_int(u,3,run.dedupe_all);sqlite3_bind_text(u,4,run.format,-1,SQLITE_TRANSIENT);sqlite3_bind_int(u,5,run.ask_artist);sqlite3_bind_int(u,6,run.ask_album);sqlite3_bind_int(u,7,run.ask_title);sqlite3_bind_int(u,8,run.ask_lyrics);sqlite3_bind_int(u,9,run.ask_image);sqlite3_bind_int(u,10,run.windows_batch);db_step_done(u);sqlite3_finalize(u);
             }
         }
         log_info("Resuming run %s (database state: %s).",run.uid,run.status);
@@ -1366,7 +1806,7 @@ int main(int argc,char **argv) {
         free(o.target);free(o.output);o.target=t;o.output=out;
         if (o.ask_image && strcmp(o.format,"mp3")!=0) log_warn("--image embedding is supported for MP3 output only; prompts will be ignored for other formats.");
         if (create_run(&app,&o,&run.uid)!=0) { db_close();free_options(&o);free_app(&app);return 2; }
-        run.target=xstrdup(o.target);run.output=xstrdup(o.output);run.format=xstrdup(o.format);run.status=xstrdup("SCANNING");run.recursive=o.recursive;run.dedupe_all=o.no_duplicates;run.ask_artist=o.ask_artist;run.ask_album=o.ask_album;run.ask_title=o.ask_title;run.ask_lyrics=o.ask_lyrics;run.ask_image=o.ask_image;run.default_artist=setting_get("default_artist");run.default_album=setting_get("default_album");
+        run.target=xstrdup(o.target);run.output=xstrdup(o.output);run.format=xstrdup(o.format);run.status=xstrdup("SCANNING");run.recursive=o.recursive;run.dedupe_all=o.no_duplicates;run.ask_artist=o.ask_artist;run.ask_album=o.ask_album;run.ask_title=o.ask_title;run.ask_lyrics=o.ask_lyrics;run.ask_image=o.ask_image;run.windows_batch=o.windows_batch;run.default_artist=setting_get("default_artist");run.default_album=setting_get("default_album");
     }
     /* On a first run, or a run interrupted during directory scanning, rebuild the inventory. */
     bool rescan = new_run || !run.status || !strcmp(run.status,"SCANNING") || !strcmp(run.status,"NEW");
